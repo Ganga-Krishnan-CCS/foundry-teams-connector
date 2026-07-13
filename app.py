@@ -31,6 +31,7 @@ import os
 import re
 import time
 import uuid
+from types import SimpleNamespace
 
 from dotenv import load_dotenv
 
@@ -120,6 +121,16 @@ def _run_agent_sync(teams_conv_id: str, user_text: str):
         },
     )
     log.info("response %s status=%s", response.id, response.status)
+    for item in response.output:
+        itype = getattr(item, "type", "?")
+        if itype == "message":
+            for block in item.content or []:
+                anns = getattr(block, "annotations", None) or []
+                log.info("  message block type=%s annotations=%d %s",
+                         getattr(block, "type", "?"), len(anns),
+                         [(getattr(a, "type", "?"), getattr(a, "filename", "?")) for a in anns])
+        else:
+            log.info("  output item type=%s", itype)
     return response
 
 
@@ -215,18 +226,47 @@ def build_reply(response) -> Activity:
     """
     text_parts: list[str] = []
     citations: dict[str, object] = {}  # file_id -> annotation, deduped
+    container_ids: list[str] = []
+    raw_texts: list[str] = []
 
     for item in response.output:
-        if getattr(item, "type", None) != "message":
+        itype = getattr(item, "type", None)
+        if itype == "code_interpreter_call" and getattr(item, "container_id", None):
+            container_ids.append(item.container_id)
+        if itype != "message":
             continue
         for block in item.content or []:
             if getattr(block, "type", None) != "output_text":
                 continue
             if block.text:
+                raw_texts.append(block.text)
                 text_parts.append(_strip_sandbox_links(block.text))
             for ann in block.annotations or []:
                 if getattr(ann, "type", None) == "container_file_citation":
                     citations.setdefault(ann.file_id, ann)
+
+    # The model sometimes writes a sandbox link without emitting the citation
+    # annotation (observed in practice). Recover those files by name from the
+    # code interpreter container listing.
+    cited_names = {ann.filename for ann in citations.values()}
+    orphan_names = {
+        m.split("/")[-1]
+        for t in raw_texts
+        for m in _SANDBOX_BARE.findall(t)
+    } - cited_names
+    if orphan_names and container_ids:
+        for cid in container_ids:
+            for cf in openai_client.containers.files.list(container_id=cid):
+                name = (getattr(cf, "path", "") or "").split("/")[-1]
+                if name in orphan_names and cf.id not in citations:
+                    log.info("recovered uncited file %s (%s) from container %s", cf.id, name, cid)
+                    citations[cf.id] = SimpleNamespace(
+                        type="container_file_citation",
+                        file_id=cf.id, container_id=cid, filename=name,
+                    )
+                    orphan_names.discard(name)
+    if orphan_names:
+        log.warning("files mentioned in text but not recoverable: %s", sorted(orphan_names))
 
     # Code Interpreter often cites the same chart twice: the inline render gets
     # an auto-generated name (<file_id>.png) and plt.savefig() a real one. When
