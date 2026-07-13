@@ -228,6 +228,21 @@ def build_reply(response) -> Activity:
                 if getattr(ann, "type", None) == "container_file_citation":
                     citations.setdefault(ann.file_id, ann)
 
+    # Code Interpreter often cites the same chart twice: the inline render gets
+    # an auto-generated name (<file_id>.png) and plt.savefig() a real one. When
+    # named images exist, drop the auto-named ones to avoid duplicates in Teams.
+    def _is_auto_named(a) -> bool:
+        return os.path.splitext(a.filename or "")[0] == a.file_id
+
+    def _is_image(a) -> bool:
+        return os.path.splitext(a.filename or "")[1].lower() in IMAGE_EXTENSIONS
+
+    if any(_is_image(a) and not _is_auto_named(a) for a in citations.values()):
+        citations = {
+            fid: a for fid, a in citations.items()
+            if not (_is_image(a) and _is_auto_named(a))
+        }
+
     attachments: list[Attachment] = []
     for ann in citations.values():
         filename = ann.filename or f"{ann.file_id}.dat"

@@ -1,4 +1,6 @@
 .venv/
+.venv-azcli/
 __pycache__/
 *.pyc
 .env
+test_outputs/
