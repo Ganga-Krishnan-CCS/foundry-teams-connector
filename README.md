@@ -122,10 +122,29 @@ End users need **no Azure access of any kind** — see "Security model" below.
   restarts drop context. Task 6: durable storage
   (`microsoft-agents-storage-blob` or Cosmos).
 - No streaming (the publish flow doesn't support it either).
-- `extra_body={"agent_reference": {...}}` and the containers download path are
-  from the official migration/code-interpreter docs (July 2026) but not yet
-  exercised against a live project — first live run should confirm both.
-- Production hosting decision pending (App Service vs Container App).
+- ~~`agent_reference` / containers download unverified~~ — verified live
+  2026-07-14: pipeline test, DirectLine, and the real Teams client all working.
+- User-uploaded files (attachments sent TO the bot) are ignored.
+- SAS download links expire after `SAS_TTL_HOURS` (default 1 h) — a policy
+  decision for production; old blobs are never cleaned up.
+- Production hosting: recommended App Service (Linux, Always On, managed
+  identity) — see "Production deployment" below.
+
+## Production deployment (App Service)
+
+1. Create a Linux App Service (B1+, **Always On**) with a **system-assigned
+   managed identity**; deploy this repo; startup command `python app.py`.
+2. Grant the managed identity: **Azure AI User** on the Foundry project and
+   **Storage Blob Data Contributor** on the storage account (then blob auth
+   can move off connection strings).
+3. Set the `.env` values as App Service **application settings** (the
+   `CONNECTIONS__...__CLIENTSECRET` ideally as a Key Vault reference).
+4. Point the Azure Bot's messaging endpoint at
+   `https://<app>.azurewebsites.net/api/messages` — the dev tunnel is no
+   longer involved.
+5. Before scaling beyond one instance: replace the in-memory conversation map
+   and inflight-dedupe set with durable storage (blob/Cosmos) — they are
+   per-process state.
 
 ## Pinned versions
 
