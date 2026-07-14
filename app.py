@@ -37,7 +37,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from aiohttp.web import Application, Request, Response, json_response, run_app
+from aiohttp.web import Application, Request, Response, json_response, middleware, run_app
 
 from microsoft_agents.activity import (
     Activity,
@@ -315,20 +315,55 @@ AGENT_APP = AgentApplication[TurnState](
 )
 
 
+RELAY_CLIENT_ID = os.environ.get("CONNECTIONS__SERVICE_CONNECTION__SETTINGS__CLIENTID", "")
+
+_inflight: set[str] = set()  # activity ids being processed (guards channel retries)
+
+
+async def _process_and_reply(reference, teams_conv_id: str, user_text: str):
+    """Runs after the turn was ack'd: call the agent, then deliver proactively."""
+    try:
+        response = await asyncio.to_thread(_run_agent_sync, teams_conv_id, user_text)
+        reply = await asyncio.to_thread(build_reply, response)
+    except Exception as e:
+        log.exception("agent processing failed in conversation %s", teams_conv_id)
+        reply = Activity(type=ActivityTypes.message,
+                         text=f"Sorry, something went wrong: {e}")
+
+    async def _send(ctx: TurnContext):
+        await ctx.send_activity(reply)
+
+    await ADAPTER.continue_conversation(
+        RELAY_CLIENT_ID, reference.get_continuation_activity(), _send
+    )
+
+
 @AGENT_APP.activity(ActivityTypes.message)
 async def on_message(context: TurnContext, _state: TurnState):
     user_text = (context.activity.text or "").strip()
     teams_conv_id = context.activity.conversation.id
+    activity_id = context.activity.id or ""
     if not user_text:
         return
-    try:
-        await context.send_activity(Activity(type=ActivityTypes.typing))
-        response = await asyncio.to_thread(_run_agent_sync, teams_conv_id, user_text)
-        reply = await asyncio.to_thread(build_reply, response)
-        await context.send_activity(reply)
-    except Exception as e:
-        log.exception("failed handling message in conversation %s", teams_conv_id)
-        await context.send_activity(f"Sorry, something went wrong: {e}")
+    # Channels redeliver activities they consider unacknowledged; don't run
+    # the agent twice for the same activity id.
+    if activity_id and activity_id in _inflight:
+        log.info("duplicate delivery of activity %s ignored", activity_id)
+        return
+    if activity_id:
+        _inflight.add(activity_id)
+
+    await context.send_activity(Activity(type=ActivityTypes.typing))
+    reference = context.activity.get_conversation_reference()
+
+    async def _runner():
+        try:
+            await _process_and_reply(reference, teams_conv_id, user_text)
+        finally:
+            _inflight.discard(activity_id)
+
+    # ack the turn immediately; the reply goes out proactively when ready
+    asyncio.create_task(_runner())
 
 
 # ---------------------------------------------------------------------------
@@ -342,7 +377,14 @@ async def health(_req: Request) -> Response:
     return json_response({"status": "ok", "agent": FOUNDRY_AGENT_NAME or "(unset)"})
 
 
-APP = Application(middlewares=[jwt_authorization_middleware])
+@middleware
+async def _auth_except_health(request: Request, handler):
+    if request.path == "/healthz":
+        return await handler(request)
+    return await jwt_authorization_middleware(request, handler)
+
+
+APP = Application(middlewares=[_auth_except_health])
 APP.router.add_post("/api/messages", entry_point)
 APP.router.add_get("/healthz", health)
 APP["agent_configuration"] = CONNECTION_MANAGER.get_default_connection_configuration()
