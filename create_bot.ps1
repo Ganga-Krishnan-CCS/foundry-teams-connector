@@ -20,7 +20,13 @@ Write-Host "Creating Azure Bot '$BotName' (SingleTenant, app $AppId) -> $endpoin
 if (-not $?) { throw "bot create failed" }
 
 Write-Host "Enabling Teams channel"
-& $az bot msteams create --name $BotName --resource-group $ResourceGroup
+# `az bot msteams create` is broken against the current service API (enum
+# deserialization error); use the ARM REST API directly instead.
+$subId = & $az account show --query id -o tsv
+$channelBody = Join-Path $env:TEMP "msteams-channel.json"
+'{"location":"global","properties":{"channelName":"MsTeamsChannel","properties":{"isEnabled":true}}}' |
+    Out-File -Encoding ascii $channelBody
+& $az rest --method put --url "https://management.azure.com/subscriptions/$subId/resourceGroups/$ResourceGroup/providers/Microsoft.BotService/botServices/$BotName/channels/MsTeamsChannel?api-version=2022-09-15" --body "@$channelBody" --output none
 if (-not $?) { throw "teams channel failed" }
 
 Write-Host "Building Teams app package"

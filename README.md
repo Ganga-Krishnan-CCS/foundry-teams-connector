@@ -85,6 +85,37 @@ locally, managed identity in Azure) needs access to the Foundry project
 1. "Create a CSV of 12 months of sales and give me the file." → Download button.
 2. "Plot that as a bar chart." → chart renders inline.
 
+## Adapting this to your own agent / subscription
+
+Nothing in the relay is specific to one agent — everything is config. Checklist:
+
+1. **Prereqs**: Python 3.11, `pip install -r requirements.txt`, Azure CLI
+   (pip-installable, see `.venv-azcli` pattern / `run_local.ps1`).
+2. **Entra**: one app registration (single tenant, no API permissions) +
+   client secret. This is the bot's identity.
+3. **`.env`** (copy `.env.example`): your Foundry project endpoint + agent
+   NAME; the app registration's client id/secret/tenant; a storage-account
+   connection string for download links.
+4. **Foundry access**: the identity running the relay (your `az login` user
+   locally; managed identity in production) needs the **Azure AI User** role
+   on the Foundry project — otherwise file downloads return 401.
+5. **Azure Bot**: `.\create_bot.ps1 -AppId <client-id> -TunnelHost <host>`
+   (creates the bot, enables the Teams channel, builds `teams-app/foundry-relay.zip`).
+   Note: bot handles are globally unique — pass `-BotName`.
+6. **Validate the Foundry leg without Teams**: `.\run_local.ps1 test_foundry_pipeline.py`.
+7. **Teams**: upload/approve the zip (org catalog, one-time Teams admin
+   approval), start relay + tunnel (`start_all.ps1`), chat.
+
+End users need **no Azure access of any kind** — see "Security model" below.
+
+## Security model (who needs access to what)
+
+| Principal | Needs |
+|---|---|
+| Relay's identity (dev: your user; prod: managed identity) | Azure AI User on the Foundry project; write access to the storage account |
+| Bot app registration | Nothing beyond existing — it only authenticates bot traffic |
+| Teams end users | **Nothing.** The Teams admin makes the app available; users add it and chat. File downloads work via short-lived SAS URLs embedded in the card — the link itself is the authorization (`SAS_TTL_HOURS`, default 1 h). Users never touch Foundry, Blob, or Azure. |
+
 ## Known limitations / next steps
 
 - Conversation map (Teams conversation → Foundry conversation) is in-memory —
