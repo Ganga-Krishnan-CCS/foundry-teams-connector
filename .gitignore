@@ -4,4 +4,4 @@ __pycache__/
 *.pyc
 .env
 test_outputs/
-teams-app/
+teams-app/*.zip
