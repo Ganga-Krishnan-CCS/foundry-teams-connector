@@ -12,6 +12,9 @@ Teams -> Azure Bot Service -> (messaging endpoint) -> THIS APP -> Foundry Agent
                                           re-delivers as Teams attachments
 ```
 
+> Full research and evidence for why the built-in publish path can't do this:
+> see **[RESEARCH.md](RESEARCH.md)**.
+
 ## Status of the gap (verified against official docs, 2026-07-13)
 
 - **No no-code fix exists.** The Foundry publish flow's own limitations table
