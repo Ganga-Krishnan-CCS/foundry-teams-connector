@@ -41,10 +41,11 @@ def show_response(response) -> None:
 
 def run_turn(conv_key: str, prompt: str) -> None:
     print(f"\n=== USER: {prompt}")
-    response = app._run_agent_sync(conv_key, prompt)
+    client = app.openai_client  # shared/fallback identity — no signed-in Teams user here
+    response = app._run_agent_sync(conv_key, prompt, client)
     show_response(response)
 
-    activity = app.build_reply(response)
+    activity = app.build_reply(response, client)
     print(f"\nreply text: {activity.text!r}")
     print(f"attachments: {len(activity.attachments or [])}")
     for att in activity.attachments or []:
@@ -62,7 +63,7 @@ def run_turn(conv_key: str, prompt: str) -> None:
             for ann in getattr(block, "annotations", None) or []:
                 if getattr(ann, "type", None) == "container_file_citation" and ann.file_id not in seen:
                     seen.add(ann.file_id)
-                    data = app._download_container_file_sync(ann.container_id, ann.file_id)
+                    data = app._download_container_file_sync(client, ann.container_id, ann.file_id)
                     path = os.path.join(OUT_DIR, ann.filename or ann.file_id)
                     with open(path, "wb") as f:
                         f.write(data)

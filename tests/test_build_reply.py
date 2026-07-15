@@ -17,7 +17,7 @@ os.environ.setdefault("CONNECTIONS__SERVICE_CONNECTION__SETTINGS__TENANTID", "00
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import app  # noqa: E402
 
-app._download_container_file_sync = lambda c, f: b"\x89PNG fake bytes"
+app._download_container_file_sync = lambda client, c, f: b"\x89PNG fake bytes"
 app._upload_to_blob_sync = lambda data, name: f"https://blob.example/{name}"
 
 

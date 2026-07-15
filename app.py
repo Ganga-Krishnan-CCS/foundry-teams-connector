@@ -58,6 +58,8 @@ from microsoft_agents.hosting.core import (
     TurnState,
 )
 
+from openai import OpenAI
+
 from azure.ai.projects import AIProjectClient
 from azure.identity import DefaultAzureCredential
 from azure.storage.blob import (
@@ -95,38 +97,62 @@ IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
 # for environments where nobody can grant the identity a data-plane role yet.
 FOUNDRY_API_KEY = os.environ.get("FOUNDRY_API_KEY", "")
 
-if FOUNDRY_API_KEY:
-    from openai import OpenAI
+# Name of the AgentApplication auth handler (AGENTAPPLICATION__USERAUTHORIZATION__
+# HANDLERS__<name>__...) used to get each Teams user's own token for Foundry.
+# Required for per-user Fabric/RLS behavior — see README "Per-user identity".
+FOUNDRY_AUTH_HANDLER = os.environ.get("FOUNDRY_AUTH_HANDLER_NAME", "FOUNDRY")
 
-    openai_client = OpenAI(
-        base_url=f"{FOUNDRY_PROJECT_ENDPOINT.rstrip('/')}/openai/v1",
-        api_key=FOUNDRY_API_KEY,
-        default_headers={"api-key": FOUNDRY_API_KEY},
-    )
-    log.info("Foundry auth: account API key")
-else:
+
+def _shared_client() -> OpenAI:
+    """Fallback client used when no signed-in user token is available (local
+    testing via test_foundry_pipeline.py, or a bot with no auth handler wired
+    yet). Fabric/RLS-sensitive tools will see this identity for every caller —
+    see README caveat."""
+    if FOUNDRY_API_KEY:
+        return OpenAI(
+            base_url=f"{FOUNDRY_PROJECT_ENDPOINT.rstrip('/')}/openai/v1",
+            api_key=FOUNDRY_API_KEY,
+            default_headers={"api-key": FOUNDRY_API_KEY},
+        )
     project = AIProjectClient(
         endpoint=FOUNDRY_PROJECT_ENDPOINT,
         credential=DefaultAzureCredential(),
     )
-    openai_client = project.get_openai_client()
-    log.info("Foundry auth: Entra identity (DefaultAzureCredential)")
+    return project.get_openai_client()
 
-# One Foundry conversation per Teams conversation. In-memory = demo only;
-# swap for durable storage (task 6) before anything real.
+
+def _user_client(user_token: str) -> OpenAI:
+    """Client scoped to one Teams user's own Entra token — required so tools
+    with identity passthrough (Fabric data agent) enforce THAT user's row/table
+    level security, matching direct-publish behavior. See the Fabric tool docs:
+    service-principal/API-key auth is explicitly unsupported for that tool."""
+    return OpenAI(
+        base_url=f"{FOUNDRY_PROJECT_ENDPOINT.rstrip('/')}/openai/v1",
+        api_key=user_token,
+    )
+
+
+openai_client = _shared_client()
+log.info("Foundry auth (fallback/shared client): %s",
+         "account API key" if FOUNDRY_API_KEY else "Entra identity (DefaultAzureCredential)")
+
+# One Foundry conversation per signed-in USER (not per Teams thread) — matches
+# how direct-publish scopes a session to the signed-in identity, and means the
+# same person gets the same context across 1:1 and group chats. In-memory =
+# demo only; swap for durable storage (task 6) before anything real.
 _conversations: dict[str, str] = {}
 
 
-def _run_agent_sync(teams_conv_id: str, user_text: str):
+def _run_agent_sync(user_key: str, user_text: str, client: OpenAI):
     """Send user_text to the agent inside a persistent conversation; return the Response."""
-    conv_id = _conversations.get(teams_conv_id)
+    conv_id = _conversations.get(user_key)
     if not conv_id:
-        conversation = openai_client.conversations.create()
+        conversation = client.conversations.create()
         conv_id = conversation.id
-        _conversations[teams_conv_id] = conv_id
-        log.info("created conversation %s for Teams conversation %s", conv_id, teams_conv_id)
+        _conversations[user_key] = conv_id
+        log.info("created conversation %s for user %s", conv_id, user_key)
 
-    response = openai_client.responses.create(
+    response = client.responses.create(
         conversation=conv_id,
         input=user_text,
         extra_body={
@@ -150,9 +176,9 @@ def _run_agent_sync(teams_conv_id: str, user_text: str):
     return response
 
 
-def _download_container_file_sync(container_id: str, file_id: str) -> bytes:
+def _download_container_file_sync(client: OpenAI, container_id: str, file_id: str) -> bytes:
     """The core 'do what the playground does' step: fetch output bytes by id."""
-    content = openai_client.containers.files.content.retrieve(
+    content = client.containers.files.content.retrieve(
         file_id=file_id, container_id=container_id
     )
     return content.read()
@@ -234,12 +260,15 @@ def _strip_sandbox_links(text: str) -> str:
     return _SANDBOX_BARE.sub("", text).strip()
 
 
-def build_reply(response) -> Activity:
+def build_reply(response, client: OpenAI = None) -> Activity:
     """One Teams activity: cleaned text + inline images + file download buttons.
 
     On the new surface every generated file (chart PNGs included) arrives as a
     container_file_citation annotation on an output_text content block.
+    `client` must be the SAME client (same identity) used for the responses.create
+    call, so file downloads honor the same per-user access as the agent run.
     """
+    client = client or openai_client
     text_parts: list[str] = []
     citations: dict[str, object] = {}  # file_id -> annotation, deduped
     container_ids: list[str] = []
@@ -272,7 +301,7 @@ def build_reply(response) -> Activity:
     } - cited_names
     if orphan_names and container_ids:
         for cid in container_ids:
-            for cf in openai_client.containers.files.list(container_id=cid):
+            for cf in client.containers.files.list(container_id=cid):
                 name = (getattr(cf, "path", "") or "").split("/")[-1]
                 if name in orphan_names and cf.id not in citations:
                     log.info("recovered uncited file %s (%s) from container %s", cf.id, name, cid)
@@ -302,7 +331,7 @@ def build_reply(response) -> Activity:
     attachments: list[Attachment] = []
     for ann in citations.values():
         filename = ann.filename or f"{ann.file_id}.dat"
-        data = _download_container_file_sync(ann.container_id, ann.file_id)
+        data = _download_container_file_sync(client, ann.container_id, ann.file_id)
         ext = os.path.splitext(filename)[1].lower()
         log.info("output file %s (%s): %d bytes", ann.file_id, filename, len(data))
         if ext in IMAGE_EXTENSIONS:
@@ -336,13 +365,21 @@ RELAY_CLIENT_ID = os.environ.get("CONNECTIONS__SERVICE_CONNECTION__SETTINGS__CLI
 _inflight: set[str] = set()  # activity ids being processed (guards channel retries)
 
 
-async def _process_and_reply(reference, teams_conv_id: str, user_text: str):
+def _user_key(context: TurnContext) -> str:
+    """Stable per-user id: prefer the Entra object id (stable across chats/
+    tenexchanges), fall back to the channel's own user id (e.g. DirectLine
+    testing with no signed-in AAD identity)."""
+    frm = context.activity.from_property
+    return getattr(frm, "aad_object_id", None) or frm.id
+
+
+async def _process_and_reply(reference, user_key: str, user_text: str, client: OpenAI):
     """Runs after the turn was ack'd: call the agent, then deliver proactively."""
     try:
-        response = await asyncio.to_thread(_run_agent_sync, teams_conv_id, user_text)
-        reply = await asyncio.to_thread(build_reply, response)
+        response = await asyncio.to_thread(_run_agent_sync, user_key, user_text, client)
+        reply = await asyncio.to_thread(build_reply, response, client)
     except Exception as e:
-        log.exception("agent processing failed in conversation %s", teams_conv_id)
+        log.exception("agent processing failed for user %s", user_key)
         reply = Activity(type=ActivityTypes.message,
                          text=f"Sorry, something went wrong: {e}")
 
@@ -354,10 +391,10 @@ async def _process_and_reply(reference, teams_conv_id: str, user_text: str):
     )
 
 
-@AGENT_APP.activity(ActivityTypes.message)
+@AGENT_APP.activity(ActivityTypes.message, auth_handlers=[FOUNDRY_AUTH_HANDLER])
 async def on_message(context: TurnContext, _state: TurnState):
     user_text = (context.activity.text or "").strip()
-    teams_conv_id = context.activity.conversation.id
+    user_key = _user_key(context)
     activity_id = context.activity.id or ""
     if not user_text:
         return
@@ -369,12 +406,26 @@ async def on_message(context: TurnContext, _state: TurnState):
     if activity_id:
         _inflight.add(activity_id)
 
+    # With auth_handlers set on this route, the SDK completes Teams sign-in
+    # (OAuthCard) + OBO exchange before this handler runs. Fall back to the
+    # shared client only if no handler is configured (local/dev testing).
+    client = openai_client
+    try:
+        token_response = await AGENT_APP.auth.get_token(context, FOUNDRY_AUTH_HANDLER)
+        if token_response and token_response.token:
+            client = _user_client(token_response.token)
+        else:
+            log.warning("no user token for %s; falling back to shared Foundry identity "
+                        "(Fabric/RLS-sensitive tools will NOT be scoped per-user)", user_key)
+    except Exception:
+        log.exception("token retrieval failed for %s; falling back to shared identity", user_key)
+
     await context.send_activity(Activity(type=ActivityTypes.typing))
     reference = context.activity.get_conversation_reference()
 
     async def _runner():
         try:
-            await _process_and_reply(reference, teams_conv_id, user_text)
+            await _process_and_reply(reference, user_key, user_text, client)
         finally:
             _inflight.discard(activity_id)
 

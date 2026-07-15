@@ -116,6 +116,54 @@ End users need **no Azure access of any kind** — see "Security model" below.
 | Bot app registration | Nothing beyond existing — it only authenticates bot traffic |
 | Teams end users | **Nothing.** The Teams admin makes the app available; users add it and chat. File downloads work via short-lived SAS URLs embedded in the card — the link itself is the authorization (`SAS_TTL_HOURS`, default 1 h). Users never touch Foundry, Blob, or Azure. |
 
+## Per-user identity / RLS (Fabric data agent)
+
+If the agent has a **Fabric data agent** tool, this matters: Fabric enforces
+row/table-level security only for a request made with a **signed-in user's own
+token** — its docs explicitly say service-principal/API-key auth is not
+supported. A relay calling Foundry under one shared identity (the default
+setup above) makes every Teams user see that one identity's data — this was
+observed directly (two users, same 5-table result) before the fix below.
+
+Direct-publish avoids this by making each user complete a one-time Foundry
+sign-in (via a Microsoft-managed OAuth broker) before their first tool call.
+`app.py` replicates the same effect using the M365 Agents SDK's built-in OAuth
++ on-behalf-of (OBO) support:
+
+- `on_message` is registered with `auth_handlers=["FOUNDRY"]`, so the SDK
+  handles the sign-in card + OBO token exchange before the handler runs.
+- The exchanged user token builds a **per-request** OpenAI client
+  (`_user_client`); that same client is used for the agent call, the file
+  downloads, and orphan-file recovery, so everything in one turn is
+  consistently scoped to that user.
+- The conversation map is now keyed by **user** (Entra object id), not by
+  Teams thread — matching direct-publish's per-identity session and giving
+  each person their own context across 1:1 and group chats.
+- If no token is available (auth not configured yet, or a test harness with
+  no signed-in user), it falls back to the shared identity and logs a warning
+  — same single-identity behavior as before, not a crash.
+
+**Setup** (blocked on an Entra admin — same shape as the bot app registration
+ask): an Azure Bot Service OAuth connection (`Aadv2` provider) on the bot's app
+registration, granted delegated **`user_impersonation`** on the first-party
+resource **"Azure Machine Learning Services"** (appId
+`18a66f5f-dbdf-4c17-9dd7-1634712a9cbe`) — adding that API permission and
+consenting to it requires Application Administrator/Global Administrator (a
+Contributor cannot). Once granted:
+
+```powershell
+az ad app permission add --id <bot-app-id> --api 18a66f5f-dbdf-4c17-9dd7-1634712a9cbe --api-permissions 1a7925b5-f871-417a-9b8b-303f9f29fa10=Scope
+az ad app permission admin-consent --id <bot-app-id>
+az bot authsetting create -n <bot-name> -g <rg> -c FoundryAAD --client-id <bot-app-id> --client-secret <bot-app-secret> --service Aadv2 --provider-scope-string "18a66f5f-dbdf-4c17-9dd7-1634712a9cbe/user_impersonation"
+```
+
+Then set the three `AGENTAPPLICATION__USERAUTHORIZATION__...` values in
+`.env` (see `.env.example`) to `FoundryAAD` / the scope above, and redeploy.
+
+**Status: implemented, not yet live-verified** — blocked on the admin-consent
+step above. Once granted, validate with the original two-user test (different
+Fabric table access) through the real bot before relying on it.
+
 ## Known limitations / next steps
 
 - Conversation map (Teams conversation → Foundry conversation) is in-memory —
