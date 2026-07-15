@@ -90,11 +90,27 @@ IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
 # ---------------------------------------------------------------------------
 # Foundry clients (new surface: OpenAI-compatible conversations + responses)
 # ---------------------------------------------------------------------------
-project = AIProjectClient(
-    endpoint=FOUNDRY_PROJECT_ENDPOINT,
-    credential=DefaultAzureCredential(),
-)
-openai_client = project.get_openai_client()
+# Preferred auth: Entra identity (az login locally, managed identity in Azure)
+# via AIProjectClient. Fallback: the Foundry account API key (FOUNDRY_API_KEY)
+# for environments where nobody can grant the identity a data-plane role yet.
+FOUNDRY_API_KEY = os.environ.get("FOUNDRY_API_KEY", "")
+
+if FOUNDRY_API_KEY:
+    from openai import OpenAI
+
+    openai_client = OpenAI(
+        base_url=f"{FOUNDRY_PROJECT_ENDPOINT.rstrip('/')}/openai/v1",
+        api_key=FOUNDRY_API_KEY,
+        default_headers={"api-key": FOUNDRY_API_KEY},
+    )
+    log.info("Foundry auth: account API key")
+else:
+    project = AIProjectClient(
+        endpoint=FOUNDRY_PROJECT_ENDPOINT,
+        credential=DefaultAzureCredential(),
+    )
+    openai_client = project.get_openai_client()
+    log.info("Foundry auth: Entra identity (DefaultAzureCredential)")
 
 # One Foundry conversation per Teams conversation. In-memory = demo only;
 # swap for durable storage (task 6) before anything real.

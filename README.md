@@ -134,9 +134,14 @@ End users need **no Azure access of any kind** — see "Security model" below.
 
 1. Create a Linux App Service (B1+, **Always On**) with a **system-assigned
    managed identity**; deploy this repo; startup command `python app.py`.
-2. Grant the managed identity: **Azure AI User** on the Foundry project and
-   **Storage Blob Data Contributor** on the storage account (then blob auth
-   can move off connection strings).
+2. Grant the managed identity a Foundry data-plane role — role names vary by
+   tenant: **Azure AI User** where it exists, else the pair
+   **Foundry User** + **Azure AI Developer** (scope: the AI Services account).
+   Requires Owner/User Access Administrator; a Contributor cannot assign roles.
+   **Interim fallback** if no Owner is available: set `FOUNDRY_API_KEY` (the
+   AI account key, readable by Contributors) — the relay then talks to the
+   project's `/openai/v1` surface with key auth. Swap to managed identity
+   later by granting the roles and deleting the `FOUNDRY_API_KEY` setting.
 3. Set the `.env` values as App Service **application settings** (the
    `CONNECTIONS__...__CLIENTSECRET` ideally as a Key Vault reference).
 4. Point the Azure Bot's messaging endpoint at
