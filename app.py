@@ -102,6 +102,15 @@ FOUNDRY_API_KEY = os.environ.get("FOUNDRY_API_KEY", "")
 # Required for per-user Fabric/RLS behavior — see README "Per-user identity".
 FOUNDRY_AUTH_HANDLER = os.environ.get("FOUNDRY_AUTH_HANDLER_NAME", "FOUNDRY")
 
+# Only attach auth_handlers to the message route once the handler is actually
+# configured (its OAuth connection setting present) — asking the SDK to route
+# through a handler that doesn't exist is untested territory and this must not
+# risk breaking a bot that today has no OAuth connection wired up at all.
+_FOUNDRY_AUTH_CONFIGURED = bool(os.environ.get(
+    f"AGENTAPPLICATION__USERAUTHORIZATION__HANDLERS__{FOUNDRY_AUTH_HANDLER}"
+    "__SETTINGS__AZUREBOTOAUTHCONNECTIONNAME"
+))
+
 
 def _shared_client() -> OpenAI:
     """Fallback client used when no signed-in user token is available (local
@@ -391,7 +400,10 @@ async def _process_and_reply(reference, user_key: str, user_text: str, client: O
     )
 
 
-@AGENT_APP.activity(ActivityTypes.message, auth_handlers=[FOUNDRY_AUTH_HANDLER])
+@AGENT_APP.activity(
+    ActivityTypes.message,
+    auth_handlers=[FOUNDRY_AUTH_HANDLER] if _FOUNDRY_AUTH_CONFIGURED else None,
+)
 async def on_message(context: TurnContext, _state: TurnState):
     user_text = (context.activity.text or "").strip()
     user_key = _user_key(context)
@@ -408,17 +420,19 @@ async def on_message(context: TurnContext, _state: TurnState):
 
     # With auth_handlers set on this route, the SDK completes Teams sign-in
     # (OAuthCard) + OBO exchange before this handler runs. Fall back to the
-    # shared client only if no handler is configured (local/dev testing).
+    # shared client if the handler isn't configured yet (see
+    # _FOUNDRY_AUTH_CONFIGURED — same behavior as before this feature existed).
     client = openai_client
-    try:
-        token_response = await AGENT_APP.auth.get_token(context, FOUNDRY_AUTH_HANDLER)
-        if token_response and token_response.token:
-            client = _user_client(token_response.token)
-        else:
-            log.warning("no user token for %s; falling back to shared Foundry identity "
-                        "(Fabric/RLS-sensitive tools will NOT be scoped per-user)", user_key)
-    except Exception:
-        log.exception("token retrieval failed for %s; falling back to shared identity", user_key)
+    if _FOUNDRY_AUTH_CONFIGURED:
+        try:
+            token_response = await AGENT_APP.auth.get_token(context, FOUNDRY_AUTH_HANDLER)
+            if token_response and token_response.token:
+                client = _user_client(token_response.token)
+            else:
+                log.warning("no user token for %s; falling back to shared Foundry identity "
+                            "(Fabric/RLS-sensitive tools will NOT be scoped per-user)", user_key)
+        except Exception:
+            log.exception("token retrieval failed for %s; falling back to shared identity", user_key)
 
     await context.send_activity(Activity(type=ActivityTypes.typing))
     reference = context.activity.get_conversation_reference()
