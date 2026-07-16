@@ -368,8 +368,12 @@ sdk_config = load_configuration_from_env(os.environ)
 
 CONNECTION_MANAGER = MsalConnectionManager(**sdk_config)
 ADAPTER = CloudAdapter(connection_manager=CONNECTION_MANAGER)
+# connection_manager MUST be passed here too (not only to the adapter): the SDK
+# hands it to the OAuth/OBO handlers as their _connection_manager. Without it the
+# on-behalf-of exchange hits `'NoneType' object has no attribute 'get_connection'`.
 AGENT_APP = AgentApplication[TurnState](
-    storage=MemoryStorage(), adapter=ADAPTER, **sdk_config
+    storage=MemoryStorage(), adapter=ADAPTER,
+    connection_manager=CONNECTION_MANAGER, **sdk_config
 )
 
 
