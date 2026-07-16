@@ -5,3 +5,5 @@ __pycache__/
 .env
 test_outputs/
 teams-app/*.zip
+PRODUCTION-REVIEW.md
+SESSION-HANDOFF.md

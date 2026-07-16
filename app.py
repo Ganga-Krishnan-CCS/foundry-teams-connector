@@ -113,10 +113,11 @@ _FOUNDRY_AUTH_CONFIGURED = bool(os.environ.get(
 
 
 def _shared_client() -> OpenAI:
-    """Fallback client used when no signed-in user token is available (local
-    testing via test_foundry_pipeline.py, or a bot with no auth handler wired
-    yet). Fabric/RLS-sensitive tools will see this identity for every caller —
-    see README caveat."""
+    """OFFLINE TESTS ONLY — never serves live Teams traffic. Used by
+    test_foundry_pipeline.py / tests/test_build_reply.py, which have no
+    signed-in user. The live message path is per-user only (see on_message);
+    this shared identity must never handle a real caller's turn, or every user
+    would see one identity's Fabric data instead of their own."""
     if FOUNDRY_API_KEY:
         return OpenAI(
             base_url=f"{FOUNDRY_PROJECT_ENDPOINT.rstrip('/')}/openai/v1",
@@ -141,8 +142,11 @@ def _user_client(user_token: str) -> OpenAI:
     )
 
 
+# Built at import for the offline test harness only. The live path constructs a
+# per-user client each turn (see on_message) and never touches this — it must
+# not, or one identity's data would leak across users. See _shared_client.
 openai_client = _shared_client()
-log.info("Foundry auth (fallback/shared client): %s",
+log.info("Shared/offline Foundry client built (%s) — NOT used for live turns",
          "account API key" if FOUNDRY_API_KEY else "Entra identity (DefaultAzureCredential)")
 
 # One Foundry conversation per signed-in USER (not per Teams thread) — matches
@@ -418,21 +422,27 @@ async def on_message(context: TurnContext, _state: TurnState):
     if activity_id:
         _inflight.add(activity_id)
 
-    # With auth_handlers set on this route, the SDK completes Teams sign-in
-    # (OAuthCard) + OBO exchange before this handler runs. Fall back to the
-    # shared client if the handler isn't configured yet (see
-    # _FOUNDRY_AUTH_CONFIGURED — same behavior as before this feature existed).
-    client = openai_client
-    if _FOUNDRY_AUTH_CONFIGURED:
-        try:
-            token_response = await AGENT_APP.auth.get_token(context, FOUNDRY_AUTH_HANDLER)
-            if token_response and token_response.token:
-                client = _user_client(token_response.token)
-            else:
-                log.warning("no user token for %s; falling back to shared Foundry identity "
-                            "(Fabric/RLS-sensitive tools will NOT be scoped per-user)", user_key)
-        except Exception:
-            log.exception("token retrieval failed for %s; falling back to shared identity", user_key)
+    # Per-user identity is MANDATORY (README "Per-user identity / RLS"): with
+    # auth_handlers set on this route, the SDK completes Teams sign-in (OAuthCard)
+    # + OBO exchange before this handler runs, and get_token returns THAT user's
+    # token. We NEVER fall back to a shared identity — serving one caller under
+    # another's identity would leak data across users and defeat Fabric per-user
+    # RLS. If no user token is available, refuse the turn.
+    try:
+        token_response = await AGENT_APP.auth.get_token(context, FOUNDRY_AUTH_HANDLER)
+    except Exception:
+        log.exception("token retrieval failed for %s; refusing turn", user_key)
+        token_response = None
+    if not (token_response and token_response.token):
+        log.warning("no per-user token for %s; refusing turn (no shared fallback)", user_key)
+        if activity_id:
+            _inflight.discard(activity_id)
+        await context.send_activity(
+            "I couldn't verify your identity, so I can't access your data. "
+            "Please complete the sign-in prompt and try again."
+        )
+        return
+    client = _user_client(token_response.token)
 
     await context.send_activity(Activity(type=ActivityTypes.typing))
     reference = context.activity.get_conversation_reference()
@@ -477,4 +487,16 @@ if __name__ == "__main__":
     }.items() if not v]
     if missing:
         raise SystemExit(f"Missing required env vars: {', '.join(missing)} (see .env.example)")
+    # Per-user identity is a hard requirement — there is no shared-identity
+    # fallback on the live path. Refuse to start if the FOUNDRY OAuth connection
+    # isn't wired, so a misconfigured deploy fails loudly here instead of booting
+    # "healthy" and refusing every user's turn. See .env.example / README.
+    if not _FOUNDRY_AUTH_CONFIGURED:
+        raise SystemExit(
+            "Per-user identity is required but no FOUNDRY OAuth connection is "
+            "configured. Set AGENTAPPLICATION__USERAUTHORIZATION__HANDLERS__"
+            f"{FOUNDRY_AUTH_HANDLER}__SETTINGS__AZUREBOTOAUTHCONNECTIONNAME "
+            "(plus OBOCONNECTIONNAME + SCOPES) — see .env.example / README "
+            "'Per-user identity / RLS'."
+        )
     run_app(APP, host="0.0.0.0", port=int(os.environ.get("PORT", 3978)))
