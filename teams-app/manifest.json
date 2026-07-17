@@ -10,8 +10,8 @@
     "termsOfUseUrl": "https://www.ccs-technologies.com/terms"
   },
   "name": {
-    "short": "Order_Insights",
-    "full": "Order_Insights (files & charts)"
+    "short": "Order_Insights Bot",
+    "full": "Order_Insights Bot (files & charts)"
   },
   "description": {
     "short": "AI assistant that delivers files and charts in Teams",
@@ -31,7 +31,7 @@
     }
   ],
   "permissions": ["identity", "messageTeamMembers"],
-  "validDomains": ["token.botframework.com"],
+  "validDomains": ["token.botframework.com", "login.microsoftonline.com"],
   "webApplicationInfo": {
     "id": "__BOT_APP_ID__",
     "resource": "api://botid-__BOT_APP_ID__"
