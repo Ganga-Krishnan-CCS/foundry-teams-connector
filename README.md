@@ -76,9 +76,12 @@ devtunnel host -p 3978 --allow-anonymous
 #   https://<tunnel-host>/api/messages
 ```
 
-The identity running the relay (`DefaultAzureCredential`: your `az login`
-locally, managed identity in Azure) needs access to the Foundry project
-(e.g. **Azure AI User** role), or file downloads return 401.
+Note: the app **refuses to start** unless the per-user OAuth settings are
+present (see "Per-user identity / RLS") — there is no shared-identity mode on
+the live path. For validating the Foundry leg without Teams, use
+`test_foundry_pipeline.py`, which uses a shared/offline client
+(`FOUNDRY_API_KEY` or `DefaultAzureCredential` with the **Foundry User** role
+— formerly named Azure AI User).
 
 ### End-to-end test prompts (in Teams)
 
@@ -91,14 +94,21 @@ Nothing in the relay is specific to one agent — everything is config. Checklis
 
 1. **Prereqs**: Python 3.11, `pip install -r requirements.txt`, Azure CLI
    (pip-installable, see `.venv-azcli` pattern / `run_local.ps1`).
-2. **Entra**: one app registration (single tenant, no API permissions) +
-   client secret. This is the bot's identity.
+2. **Entra**: one app registration (single tenant) + client secret. This is
+   the bot's identity. For per-user SSO it also needs: Application ID URI
+   `api://botid-<app-id>` exposing an `access_as_user` scope (pre-authorize
+   Teams clients `5e3ce6c0-2b1f-4285-8d4b-75ee78787346` and
+   `1fec8e78-bce4-4aaf-ab1b-5451cc387264`), and redirect URI
+   `https://token.botframework.com/.auth/web/redirect`.
 3. **`.env`** (copy `.env.example`): your Foundry project endpoint + agent
    NAME; the app registration's client id/secret/tenant; a storage-account
    connection string for download links.
-4. **Foundry access**: the identity running the relay (your `az login` user
-   locally; managed identity in production) needs the **Azure AI User** role
-   on the Foundry project — otherwise file downloads return 401.
+4. **Foundry access**: live turns run under **each end user's own identity**
+   (see "Per-user identity / RLS") — every end user needs a Foundry role
+   (below). The relay's own identity (your `az login` user locally; managed
+   identity or `FOUNDRY_API_KEY` in production) is only used by the offline
+   pipeline test and needs **Foundry User** (formerly Azure AI User) on the
+   project.
 5. **Azure Bot**: `.\create_bot.ps1 -AppId <client-id> -TunnelHost <host>`
    (creates the bot, enables the Teams channel, builds `teams-app/foundry-relay.zip`).
    Note: bot handles are globally unique — pass `-BotName`.
@@ -106,63 +116,87 @@ Nothing in the relay is specific to one agent — everything is config. Checklis
 7. **Teams**: upload/approve the zip (org catalog, one-time Teams admin
    approval), start relay + tunnel (`start_all.ps1`), chat.
 
-End users need **no Azure access of any kind** — see "Security model" below.
-
 ## Security model (who needs access to what)
+
+Every live turn is executed **as the signed-in end user** (fail-closed: no
+token → the turn is refused). That means end users must be authorized at each
+hop — this matches the requirements of Microsoft's native publish path for
+Fabric-tool agents (their Fabric tool doc: "Assign developers **and end users**
+at least the Foundry User Azure RBAC role").
 
 | Principal | Needs |
 |---|---|
-| Relay's identity (dev: your user; prod: managed identity) | Azure AI User on the Foundry project; write access to the storage account |
-| Bot app registration | Nothing beyond existing — it only authenticates bot traffic |
-| Teams end users | **Nothing.** The Teams admin makes the app available; users add it and chat. File downloads work via short-lived SAS URLs embedded in the card — the link itself is the authorization (`SAS_TTL_HOURS`, default 1 h). Users never touch Foundry, Blob, or Azure. |
+| Teams end users | (1) one-time Entra consent to the bot's `access_as_user` (self-serve card in Teams); (2) **Foundry Agent Consumer** at agent scope — or **Foundry User** at project scope — on the Foundry resource; (3) if the agent has a Fabric tool: READ on the Fabric data agent + underlying data-source permissions (this is where RLS applies) and coverage by the Fabric "Copilot and Azure OpenAI" tenant settings (incl. cross-geo for non-EU/US capacities). Manage all three via one security group. |
+| Relay's identity (offline test only) | **Foundry User** on the project (or `FOUNDRY_API_KEY`); write access to the storage account for blob/SAS delivery |
+| Bot app registration | Delegated `access_as_user` on itself (exposed API); the Bot OAuth connection + OBO exchange run under it |
+
+File downloads are delivered via short-lived SAS URLs embedded in the card
+(`SAS_TTL_HOURS`, default 1 h) — users never touch Blob/Azure directly.
 
 ## Per-user identity / RLS (Fabric data agent)
 
 If the agent has a **Fabric data agent** tool, this matters: Fabric enforces
 row/table-level security only for a request made with a **signed-in user's own
 token** — its docs explicitly say service-principal/API-key auth is not
-supported. A relay calling Foundry under one shared identity (the default
-setup above) makes every Teams user see that one identity's data — this was
-observed directly (two users, same 5-table result) before the fix below.
+supported. A relay calling Foundry under one shared identity would make every
+Teams user see that one identity's data — this was observed directly (two
+users, same 5-table result) before per-user identity was implemented.
 
 Direct-publish avoids this by making each user complete a one-time Foundry
 sign-in (via a Microsoft-managed OAuth broker) before their first tool call.
 `app.py` replicates the same effect using the M365 Agents SDK's built-in OAuth
-+ on-behalf-of (OBO) support:
++ on-behalf-of (OBO) support. **Per-user identity is mandatory and fail-closed**:
 
 - `on_message` is registered with `auth_handlers=["FOUNDRY"]`, so the SDK
-  handles the sign-in card + OBO token exchange before the handler runs.
+  handles the sign-in (silent SSO via token exchange; card as fallback) + OBO
+  token exchange before the handler runs.
 - The exchanged user token builds a **per-request** OpenAI client
   (`_user_client`); that same client is used for the agent call, the file
   downloads, and orphan-file recovery, so everything in one turn is
   consistently scoped to that user.
-- The conversation map is now keyed by **user** (Entra object id), not by
-  Teams thread — matching direct-publish's per-identity session and giving
-  each person their own context across 1:1 and group chats.
-- If no token is available (auth not configured yet, or a test harness with
-  no signed-in user), it falls back to the shared identity and logs a warning
-  — same single-identity behavior as before, not a crash.
+- The conversation map is keyed by **user** (Entra object id), not by Teams
+  thread — matching direct-publish's per-identity session.
+- **No shared fallback**: if no user token can be obtained, the turn is
+  refused with a sign-in message. If the OAuth settings are missing entirely,
+  the app refuses to start. (The shared/key client exists only for the offline
+  test harness and never serves live traffic.)
+- `AgentApplication` must be constructed with `connection_manager=` (see
+  `app.py`) — without it the SDK's OBO handler crashes with
+  `'NoneType' object has no attribute 'get_connection'`.
 
-**Setup** (blocked on an Entra admin — same shape as the bot app registration
-ask): an Azure Bot Service OAuth connection (`Aadv2` provider) on the bot's app
-registration, granted delegated **`user_impersonation`** on the first-party
-resource **"Azure Machine Learning Services"** (appId
-`18a66f5f-dbdf-4c17-9dd7-1634712a9cbe`) — adding that API permission and
-consenting to it requires Application Administrator/Global Administrator (a
-Contributor cannot). Once granted:
+**Setup (live-verified 2026-07-16/17):**
 
-```powershell
-az ad app permission add --id <bot-app-id> --api 18a66f5f-dbdf-4c17-9dd7-1634712a9cbe --api-permissions 1a7925b5-f871-417a-9b8b-303f9f29fa10=Scope
-az ad app permission admin-consent --id <bot-app-id>
-az bot authsetting create -n <bot-name> -g <rg> -c FoundryAAD --client-id <bot-app-id> --client-secret <bot-app-secret> --service Aadv2 --provider-scope-string "18a66f5f-dbdf-4c17-9dd7-1634712a9cbe/user_impersonation"
-```
+1. **App registration** (bot identity): Application ID URI
+   `api://botid-<bot-app-id>` exposing scope `access_as_user`; pre-authorize
+   the Teams clients; redirect URI
+   `https://token.botframework.com/.auth/web/redirect`.
+2. **Bot OAuth connection** (`Aadv2` provider, e.g. named `TeamsSSO`):
+   - Scopes: `api://botid-<bot-app-id>/access_as_user`
+   - Token Exchange URL: `api://botid-<bot-app-id>` (enables silent SSO)
 
-Then set the three `AGENTAPPLICATION__USERAUTHORIZATION__...` values in
-`.env` (see `.env.example`) to `FoundryAAD` / the scope above, and redeploy.
+   ```powershell
+   az bot authsetting create -n <bot-name> -g <rg> -c TeamsSSO --client-id <bot-app-id> --client-secret <bot-app-secret> --service Aadv2 --provider-scope-string "api://botid-<bot-app-id>/access_as_user"
+   ```
+3. **Teams manifest**: `webApplicationInfo.id` = bot app id;
+   `webApplicationInfo.resource` = `api://botid-<bot-app-id>` (**no scope
+   suffix** — it must equal the Application ID URI exactly; a `/access_as_user`
+   suffix breaks SSO with "app does not exist or has been uninstalled");
+   `validDomains` must include `token.botframework.com` and
+   `login.microsoftonline.com`.
+4. **App settings** (see `.env.example`): `AZUREBOTOAUTHCONNECTIONNAME` = the
+   Bot OAuth connection name; `OBOCONNECTIONNAME=SERVICE_CONNECTION` (the MSAL
+   connection performs the exchange — not the Bot OAuth connection);
+   `SCOPES=https://ai.azure.com/.default` (Foundry rejects other audiences
+   with 401 "audience is incorrect").
+5. **Per end user**: Foundry RBAC role (Agent Consumer / Foundry User), Fabric
+   data agent + data-source access, Fabric "Copilot and Azure OpenAI" tenant
+   settings coverage — see "Security model".
 
-**Status: implemented, not yet live-verified** — blocked on the admin-consent
-step above. Once granted, validate with the original two-user test (different
-Fabric table access) through the real bot before relying on it.
+**Status: live-verified through real Teams (2026-07-16/17)** — sign-in, OBO,
+and per-user Foundry calls all working. Remaining validation: the two-user
+Fabric test (different table access → different results) once Fabric tenant
+settings (cross-geo Azure OpenAI processing for non-EU/US capacities) and
+per-user roles are in place for the testers.
 
 ## Known limitations / next steps
 
@@ -182,14 +216,13 @@ Fabric table access) through the real bot before relying on it.
 
 1. Create a Linux App Service (B1+, **Always On**) with a **system-assigned
    managed identity**; deploy this repo; startup command `python app.py`.
-2. Grant the managed identity a Foundry data-plane role — role names vary by
-   tenant: **Azure AI User** where it exists, else the pair
-   **Foundry User** + **Azure AI Developer** (scope: the AI Services account).
-   Requires Owner/User Access Administrator; a Contributor cannot assign roles.
-   **Interim fallback** if no Owner is available: set `FOUNDRY_API_KEY` (the
-   AI account key, readable by Contributors) — the relay then talks to the
-   project's `/openai/v1` surface with key auth. Swap to managed identity
-   later by granting the roles and deleting the `FOUNDRY_API_KEY` setting.
+2. Live traffic runs under each end user's own token (per-user OBO), so the
+   box identity is NOT used for agent calls. Grant end users **Foundry Agent
+   Consumer** (agent scope) or **Foundry User** (project scope; formerly named
+   Azure AI User — note Microsoft's RBAC doc says do NOT use "Azure AI
+   Developer" for Foundry work). Role assignment requires Owner/User Access
+   Administrator; a Contributor cannot assign roles. `FOUNDRY_API_KEY` /
+   managed identity only serve the offline pipeline test.
 3. Set the `.env` values as App Service **application settings** (the
    `CONNECTIONS__...__CLIENTSECRET` ideally as a Key Vault reference).
 4. Point the Azure Bot's messaging endpoint at

@@ -1,5 +1,14 @@
 # Project brief: deliver Foundry agent file downloads + inline charts into Microsoft Teams
 
+> **HISTORICAL DOCUMENT (original brief, 2026-07).** The project has since been
+> built and live-verified — see **README.md** for current architecture and
+> status. Notable ways this brief is superseded: the classic threads/runs API it
+> describes (`image_contents`, `file_path_annotations`, `files.get_content`,
+> `MicrosoftAppId/Password` config) was replaced by the Responses/`agent_reference`
+> surface + M365 Agents SDK; the relay now also does **per-user identity (Teams
+> SSO + OBO, fail-closed)** for Fabric RLS, which this brief predates. Task list
+> items 1–5 and 7–8 are done; 6 (durable storage) and 9 (product track) remain.
+
 Paste this whole file as your opening prompt in Claude Code, then work through the
 task list. It contains everything needed to continue without re-explaining.
 
