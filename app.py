@@ -397,6 +397,11 @@ async def _process_and_reply(reference, user_key: str, user_text: str, client: O
         reply = await asyncio.to_thread(build_reply, response, client)
     except Exception as e:
         log.exception("agent processing failed for user %s", user_key)
+        # Drop this user's Foundry conversation: a failed run (e.g. a Fabric
+        # tool_user_error) can leave the server-side conversation in a state
+        # that rejects every subsequent turn with 400 invalid_payload. Starting
+        # a fresh conversation on the next message recovers automatically.
+        _conversations.pop(user_key, None)
         reply = Activity(type=ActivityTypes.message,
                          text=f"Sorry, something went wrong: {e}")
 

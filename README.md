@@ -126,7 +126,7 @@ at least the Foundry User Azure RBAC role").
 
 | Principal | Needs |
 |---|---|
-| Teams end users | (1) one-time Entra consent to the bot's `access_as_user` (self-serve card in Teams); (2) **Foundry Agent Consumer** at agent scope — or **Foundry User** at project scope — on the Foundry resource; (3) if the agent has a Fabric tool: READ on the Fabric data agent + underlying data-source permissions (this is where RLS applies) and coverage by the Fabric "Copilot and Azure OpenAI" tenant settings (incl. cross-geo for non-EU/US capacities). Manage all three via one security group. |
+| Teams end users | (1) one-time Entra consent to the bot's `access_as_user` (self-serve card in Teams); (2) **Foundry User** at project scope (verified 2026-07-17: **Foundry Agent Consumer is NOT sufficient** — the relay's conversations + `agent_reference` flow needs the broader agents data actions); (3) if the agent has a Fabric tool: READ on the Fabric data agent + underlying data-source permissions (this is where RLS applies) and coverage by the Fabric "Copilot and Azure OpenAI" tenant settings (incl. cross-geo for non-EU/US capacities). Manage all three via one security group. |
 | Relay's identity (offline test only) | **Foundry User** on the project (or `FOUNDRY_API_KEY`); write access to the storage account for blob/SAS delivery |
 | Bot app registration | Delegated `access_as_user` on itself (exposed API); the Bot OAuth connection + OBO exchange run under it |
 
@@ -217,10 +217,10 @@ per-user roles are in place for the testers.
 1. Create a Linux App Service (B1+, **Always On**) with a **system-assigned
    managed identity**; deploy this repo; startup command `python app.py`.
 2. Live traffic runs under each end user's own token (per-user OBO), so the
-   box identity is NOT used for agent calls. Grant end users **Foundry Agent
-   Consumer** (agent scope) or **Foundry User** (project scope; formerly named
-   Azure AI User — note Microsoft's RBAC doc says do NOT use "Azure AI
-   Developer" for Foundry work). Role assignment requires Owner/User Access
+   box identity is NOT used for agent calls. Grant end users **Foundry User**
+   (project scope; formerly named Azure AI User — note Microsoft's RBAC doc
+   says do NOT use "Azure AI Developer" for Foundry work; Foundry Agent
+   Consumer proved insufficient). Role assignment requires Owner/User Access
    Administrator; a Contributor cannot assign roles. `FOUNDRY_API_KEY` /
    managed identity only serve the offline pipeline test.
 3. Set the `.env` values as App Service **application settings** (the
